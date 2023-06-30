@@ -6,7 +6,7 @@
     unused_assignments,
     unreachable_code
 )]
-#![feature(path_file_prefix)]
+#![feature(path_file_prefix, alloc_layout_extra)]
 
 use image::EncodableLayout;
 use std::mem::size_of;
@@ -20,10 +20,12 @@ struct UniformData {
     window_width: f32,
     window_height: f32,
     utime: f32,
+    delta_time: f32,
+    last_frame_time: f32,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Debug)]
 struct Sprite {
     top_left_position_x: f32,
     top_left_position_y: f32,
@@ -33,6 +35,27 @@ struct Sprite {
     height: f32,
     depth_base: f32,
     origin_offset_y: f32,
+
+    frame_num: u32,
+    frame_interval: f32,
+    looping: u32,
+}
+impl Sprite {
+    fn empty() -> Self {
+        Self {
+            top_left_position_x: 0.0,
+            top_left_position_y: 0.0,
+            top_left_tex_coords_x: 0.0,
+            top_left_tex_coords_y: 0.0,
+            width: 0.0,
+            height: 0.0,
+            depth_base: 0.0,
+            origin_offset_y: 0.0,
+            frame_num: 0,
+            frame_interval: 0.0,
+            looping: 0,
+        }
+    }
 }
 
 #[repr(C)]
@@ -61,6 +84,7 @@ struct PixelRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     shader: wgpu::ShaderModule,
+    bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     pipeline: wgpu::RenderPipeline,
 
@@ -69,11 +93,10 @@ struct PixelRenderer {
 
     uniform_data: UniformData,
     start_time: std::time::Instant,
-    delta_time: f32,
-    last_frame_time: f32,
 
     uniform_buffer: wgpu::Buffer,
     storage_buffer: wgpu::Buffer,
+    anim_storage_buffer: wgpu::Buffer,
 
     sorted_sprites: Vec<Sprite>,
 }
@@ -191,12 +214,25 @@ impl PixelRenderer {
             window_width: window.inner_size().width as f32,
             window_height: window.inner_size().height as f32,
             utime: 0.0,
+            delta_time: 0.0,
+            last_frame_time: 0.0,
         };
         queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniform_data]));
 
+        let size_of_storage = 16;
         let storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: 512,
+            size: size_of::<Sprite>() as u64 * size_of_storage,
+            usage: wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let anim_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 8 * size_of_storage,
             usage: wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC
                 | wgpu::BufferUsages::STORAGE
@@ -241,6 +277,16 @@ impl PixelRenderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -274,6 +320,14 @@ impl PixelRenderer {
                     binding: 2,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &storage_buffer,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &anim_storage_buffer,
                         offset: 0,
                         size: None,
                     }),
@@ -340,15 +394,15 @@ impl PixelRenderer {
             pipeline,
             texture_atlas_array,
             bind_group,
+            bind_group_layout,
             depth_stencil_texture,
             uniform_data,
             start_time,
-            delta_time: 0.0,
-            last_frame_time: 0.0,
 
             uniform_buffer,
             storage_buffer,
-            sorted_sprites: vec![],
+            anim_storage_buffer,
+            sorted_sprites: vec![Sprite::empty(); 256],
         }
     }
 
@@ -378,8 +432,8 @@ impl PixelRenderer {
 
     fn update_time(&mut self) {
         self.uniform_data.utime = self.start_time.elapsed().as_secs_f32();
-        self.delta_time = self.uniform_data.utime - self.last_frame_time;
-        self.last_frame_time = self.uniform_data.utime;
+        self.uniform_data.delta_time = self.uniform_data.utime - self.uniform_data.last_frame_time;
+        self.uniform_data.last_frame_time = self.uniform_data.utime;
         self.queue.write_buffer(
             &self.uniform_buffer,
             0,
@@ -388,24 +442,14 @@ impl PixelRenderer {
     }
 
     fn load_sprites(&mut self, sprites: &[Sprite]) {
-        // copy, sort, then submit
-        if self.sorted_sprites.len() < sprites.len() {
-            self.sorted_sprites.resize(
-                sprites.len(),
-                Sprite {
-                    top_left_position_x: 0.0,
-                    top_left_position_y: 0.0,
-                    top_left_tex_coords_x: 0.0,
-                    top_left_tex_coords_y: 0.0,
-                    width: 32.0,
-                    height: 32.0,
-                    depth_base: 0.0,
-                    origin_offset_y: 32.0,
-                },
-            );
+        if self.sorted_sprites.capacity() < sprites.len() {
+            println!("resizing");
+            self.sorted_sprites.reserve(self.sorted_sprites.len());
         }
-        self.sorted_sprites[0..sprites.len()].clone_from_slice(sprites);
-        self.sorted_sprites[0..sprites.len()].sort_unstable_by(|a, b| {
+        unsafe { self.sorted_sprites.set_len(sprites.len()) };
+
+        self.sorted_sprites.clone_from_slice(sprites);
+        self.sorted_sprites.sort_unstable_by(|a, b| {
             let depth_a = 0.2
                 * (((a.top_left_position_y - a.origin_offset_y)
                     / self.uniform_data.height_resolution)
@@ -420,6 +464,77 @@ impl PixelRenderer {
                 + b.depth_base;
             depth_b.total_cmp(&depth_a)
         });
+
+        let size_needed = sprites.len() * size_of::<Sprite>();
+        if self.storage_buffer.size() < size_needed as u64 {
+            self.storage_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                // size: size_needed as _,
+                size: self.storage_buffer.size() * 2,
+                usage: wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            self.anim_storage_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                // size: sprites.len() as u64 * 8,
+                size: self.anim_storage_buffer.size() * 2,
+                usage: wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(
+                            &self
+                                .texture_atlas_array
+                                .create_view(&wgpu::TextureViewDescriptor {
+                                    label: None,
+                                    format: None,
+                                    dimension: None,
+                                    aspect: wgpu::TextureAspect::All,
+                                    base_mip_level: 0,
+                                    mip_level_count: None,
+                                    base_array_layer: 0,
+                                    array_layer_count: None,
+                                }),
+                        ),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.uniform_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.storage_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.anim_storage_buffer,
+                            offset: 0,
+                            size: None,
+                        }),
+                    },
+                ],
+            });
+        }
         self.queue.write_buffer(
             &self.storage_buffer,
             0,
@@ -459,7 +574,8 @@ impl PixelRenderer {
         });
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, &self.bind_group, &[]);
-        render_pass.draw(0..6 * 128, 0..1);
+        // todo, change this so it always draws everything
+        render_pass.draw(0..6 * self.sorted_sprites.len() as u32, 0..1);
         drop(render_pass);
         self.queue.submit(Some(encoder.finish()));
         canvas.present();
@@ -479,7 +595,7 @@ impl Prefab {
             TextureData {
                 top_left_tex_pos: (0, 0),
                 size: (32, 32),
-                origin_offset: 32,
+                origin_offset: 24,
             },
         );
         map.insert(
@@ -487,13 +603,13 @@ impl Prefab {
             TextureData {
                 top_left_tex_pos: (0, 32),
                 size: (32, 32),
-                origin_offset: 32,
+                origin_offset: 26,
             },
         );
         map.insert(
             "bg_tile".to_string(),
             TextureData {
-                top_left_tex_pos: (32, 0),
+                top_left_tex_pos: (0, 64),
                 size: (32, 32),
                 origin_offset: 16,
             },
@@ -501,7 +617,7 @@ impl Prefab {
         map.insert(
             "spot".to_string(),
             TextureData {
-                top_left_tex_pos: (32, 32),
+                top_left_tex_pos: (0, 96),
                 size: (32, 32),
                 origin_offset: 32,
             },
@@ -510,7 +626,15 @@ impl Prefab {
         Self { map }
     }
 
-    fn gen(&self, name: &str, position: (f32, f32), layer: usize) -> Sprite {
+    fn gen(
+        &self,
+        name: &str,
+        position: (f32, f32),
+        layer: usize,
+        frame_num: u32,
+        frame_interval: f32,
+        looping: bool,
+    ) -> Sprite {
         let tex_data = self.map.get(name).unwrap();
         Sprite {
             top_left_position_x: position.0,
@@ -527,6 +651,10 @@ impl Prefab {
                 _ => panic!(),
             },
             origin_offset_y: tex_data.origin_offset as _,
+
+            frame_interval,
+            frame_num,
+            looping: if looping { 1 } else { 0 },
         }
     }
 }
@@ -556,18 +684,28 @@ impl ArrowKeyState {
 }
 
 #[derive(Clone, Debug)]
+struct ShowDeltaTime(bool);
+
+#[derive(Clone, Debug)]
 struct PlayerIndex(usize);
+
+#[derive(Clone, Debug)]
+struct Count(usize);
 
 fn entry(table: &mut ecs::Table) {
     let vector = table
         .read_resource::<ArrowKeyState>()
         .unwrap()
-        .to_vector(30f32);
+        .to_vector(1f32);
     let player_index = table.read_resource::<PlayerIndex>().unwrap();
     let player_sprite = table.read::<Sprite>(player_index.0).unwrap();
     let time = table.read_resource::<Time>().unwrap();
 
-    for each in table.read_event::<winit::event::KeyboardInput>().unwrap() {
+    if table.read_resource::<ShowDeltaTime>().unwrap().0 {
+        println!("{:?}", time.delta_time);
+    }
+
+    for each in table.handle_event::<winit::event::KeyboardInput>().unwrap() {
         if let Some(code) = each.virtual_keycode {
             match code {
                 winit::event::VirtualKeyCode::Space => match each.state {
@@ -611,13 +749,36 @@ fn entry(table: &mut ecs::Table) {
                         table.read_resource::<ArrowKeyState>().unwrap().down = false
                     }
                 },
+
+                winit::event::VirtualKeyCode::End => match each.state {
+                    winit::event::ElementState::Pressed => {
+                        let mut sprite = player_sprite.clone();
+                        sprite.depth_base = 0.0;
+                        table.insert_new(sprite);
+                    }
+                    winit::event::ElementState::Released => {}
+                },
+
+                winit::event::VirtualKeyCode::F11 => match each.state {
+                    winit::event::ElementState::Pressed => {
+                        let status = table.read_resource::<ShowDeltaTime>().unwrap();
+                        status.0 = !status.0;
+                    }
+                    winit::event::ElementState::Released => {}
+                },
                 _ => (),
             }
         }
     }
 
-    player_sprite.top_left_position_x += vector.0 as f32 * time.delta_time;
-    player_sprite.top_left_position_y += vector.1 as f32 * time.delta_time;
+    // println!(
+    //     "{:?}, {:?}",
+    //     player_sprite.top_left_position_x, player_sprite.top_left_position_y
+    // );
+    // player_sprite.top_left_position_x += vector.0 as f32 * time.delta_time;
+    // player_sprite.top_left_position_y += vector.1 as f32 * time.delta_time;
+    player_sprite.top_left_position_x += vector.0 as f32;
+    player_sprite.top_left_position_y += vector.1 as f32;
 }
 
 fn main() {
@@ -638,21 +799,28 @@ fn main() {
     ecs.table.add_resource(CloseStatus::Running).unwrap();
     let prefab = Prefab::new();
     ecs.table.add_resource(ArrowKeyState::new()).unwrap();
-    let player_index = ecs.table.insert_new(prefab.gen("char_main", (0.0, 0.0), 1));
+    let player_index = ecs
+        .table
+        .insert_new(prefab.gen("char_main", (0.0, 0.0), 1, 2, 0.1, true));
     ecs.table.add_resource(PlayerIndex(player_index)).unwrap();
-    ecs.table.insert_new(prefab.gen("char_alt", (0.0, 0.0), 1));
-    ecs.table.insert_new(prefab.gen("bg_tile", (0.0, 0.0), 2));
+    ecs.table.add_resource(ShowDeltaTime(false)).unwrap();
+    // ecs.table
+    //     .insert_new(prefab.gen("char_alt", (0.0, 0.0), 1, 1, 0.0, false));
+    // ecs.table
+    //     .insert_new(prefab.gen("bg_tile", (0.0, 0.0), 2, 1, 0.0, false));
     // loop
+
     event_loop.run(move |event, _, control_flow| {
+        // std::thread::sleep(std::time::Duration::from_secs_f32(1.0 / 300.0));
         match ecs.table.read_resource::<CloseStatus>().unwrap() {
-            CloseStatus::Running => control_flow.set_poll(),
+            CloseStatus::Running => control_flow.set_wait(),
             CloseStatus::Closed => control_flow.set_exit(),
         }
         renderer.update_time();
         *ecs.table.read_resource::<Time>().unwrap() = Time {
             start_time: renderer.start_time,
             utime: renderer.uniform_data.utime,
-            delta_time: renderer.delta_time,
+            delta_time: renderer.uniform_data.delta_time,
         };
         match event {
             winit::event::Event::WindowEvent { event, .. } => match event {
@@ -664,12 +832,36 @@ fn main() {
                 winit::event::WindowEvent::KeyboardInput { input, .. } => {
                     if ecs
                         .table
+                        // should be read event not handling them since that would flag it to be erased by the end of this tick
                         .read_event::<winit::event::KeyboardInput>()
                         .unwrap()
                         .last()
                         != Some(&input)
                     {
-                        ecs.table.add_event(input.clone());
+                        ecs.table.fire_event(input.clone());
+                    }
+                    if let Some(code) = input.virtual_keycode {
+                        match code {
+                            winit::event::VirtualKeyCode::Home => match input.state {
+                                winit::event::ElementState::Pressed => {
+                                    println!("{:?}", renderer.sorted_sprites);
+                                }
+                                winit::event::ElementState::Released => {}
+                            },
+                            winit::event::VirtualKeyCode::PageUp => match input.state {
+                                winit::event::ElementState::Pressed => {
+                                    println!("{:?}", renderer.storage_buffer.size());
+                                }
+                                winit::event::ElementState::Released => {}
+                            },
+                            winit::event::VirtualKeyCode::PageDown => match input.state {
+                                winit::event::ElementState::Pressed => {
+                                    println!("{:?}", renderer.sorted_sprites.len());
+                                }
+                                winit::event::ElementState::Released => {}
+                            },
+                            _ => (),
+                        }
                     }
                 }
                 _ => (),
@@ -681,7 +873,6 @@ fn main() {
             _ => (),
         }
         ecs.tick();
-        // all hinged on this special column
         renderer.load_sprites(&ecs.table.query_raw::<Sprite>().unwrap());
     });
 }
